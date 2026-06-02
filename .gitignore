@@ -1,17 +1,30 @@
-venv/
-
+# Python
 __pycache__/
-
 *.pyc
+*.pyo
+*.pyd
 
-logs/
-
+# Virtual Environment
+venv/
 .env
 
+# Logs
+logs/
 *.log
 
-.idea/
-
+# VS Code
 .vscode/
 
+# OS
 .DS_Store
+Thumbs.db
+
+# Secrets
+.env.local
+.env.production
+
+# Python cache
+.pytest_cache/
+
+# System files
+*.swp

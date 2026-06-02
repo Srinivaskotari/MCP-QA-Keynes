@@ -4,15 +4,15 @@ import time
 import os
 import json
 import uuid
-import threading
 import redis
 
 from datetime import datetime
+from collections import Counter
 
 from datasets import DATASETS
 
 # =========================================================
-# FASTAPI APP
+# FASTAPI
 # =========================================================
 
 app = FastAPI()
@@ -27,6 +27,10 @@ DATABASE = "domo_reports_s3"
 
 OUTPUT_BUCKET = "s3://keynes-athena-results-srinivas"
 
+AUDIT_BUCKET = "keynes-athena-results-srinivas"
+
+AUDIT_PREFIX = "mcp-audit/"
+
 MAX_QUERY_LENGTH = 5000
 
 CACHE_TTL_SECONDS = 300
@@ -36,7 +40,27 @@ LOG_DIR = "logs"
 LOG_FILE = f"{LOG_DIR}/query_history.log"
 
 # =========================================================
-# REDIS CLIENT
+# AWS CLIENTS
+# =========================================================
+
+athena = boto3.client(
+
+    "athena",
+
+    region_name=REGION
+
+)
+
+s3 = boto3.client(
+
+    "s3",
+
+    region_name=REGION
+
+)
+
+# =========================================================
+# REDIS
 # =========================================================
 
 redis_client = redis.Redis(
@@ -78,38 +102,72 @@ BLOCKED_KEYWORDS = [
 ]
 
 # =========================================================
-# LOG DIRECTORY
+# LOGS
 # =========================================================
 
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # =========================================================
-# ATHENA CLIENT
+# HELPERS
 # =========================================================
 
-athena = boto3.client(
+def get_cache_key(query):
 
-    "athena",
+    return f"cache:{query}"
 
-    region_name=REGION
+def get_registry_key(query_id):
 
-)
+    return f"registry:{query_id}"
 
-# =========================================================
-# LOGGER
-# =========================================================
-
-def log_query(entry: dict):
+def log_query(entry):
 
     with open(LOG_FILE, "a") as f:
 
         f.write(json.dumps(entry) + "\n")
 
 # =========================================================
+# AUDIT WRITER
+# =========================================================
+
+def write_audit_record(record):
+
+    try:
+
+        key = (
+
+            AUDIT_PREFIX +
+
+            f"{record['query_id']}.json"
+
+        )
+
+        s3.put_object(
+
+            Bucket=AUDIT_BUCKET,
+
+            Key=key,
+
+            Body=json.dumps(record),
+
+            ContentType="application/json"
+
+        )
+
+    except Exception as e:
+
+        print(
+
+            "Audit write failed:",
+
+            str(e)
+
+        )
+
+# =========================================================
 # SQL VALIDATION
 # =========================================================
 
-def validate_sql(sql: str):
+def validate_sql(sql):
 
     sql_upper = sql.upper()
 
@@ -120,7 +178,7 @@ def validate_sql(sql: str):
             "valid": False,
 
             "error":
-            "Query exceeds maximum allowed length"
+            "Query exceeds maximum length"
 
         }
 
@@ -142,7 +200,7 @@ def validate_sql(sql: str):
             "valid": False,
 
             "error":
-            "Only SELECT/SHOW/WITH queries allowed"
+            "Only SELECT/SHOW/WITH allowed"
 
         }
 
@@ -155,30 +213,36 @@ def validate_sql(sql: str):
                 "valid": False,
 
                 "error":
-                f"Blocked keyword detected: {keyword}"
+                f"Blocked keyword: {keyword}"
 
             }
 
-    found_allowed_table = False
+    dataset = None
+
+    found = False
 
     for table in ALLOWED_TABLES:
 
         if table.lower() in sql.lower():
 
-            found_allowed_table = True
+            dataset = table
+
+            found = True
+
             break
 
     if sql_upper.startswith("SHOW COLUMNS"):
-        found_allowed_table = True
 
-    if not found_allowed_table:
+        found = True
+
+    if not found:
 
         return {
 
             "valid": False,
 
             "error":
-            "Unauthorized table access"
+            "Unauthorized table"
 
         }
 
@@ -193,218 +257,239 @@ def validate_sql(sql: str):
 
         "valid": True,
 
-        "sql": sql
+        "sql": sql,
+
+        "dataset": dataset
 
     }
 
 # =========================================================
-# REDIS HELPERS
+# REGISTRY
 # =========================================================
 
-def get_cache_key(query):
+def register_query(
 
-    return f"cache:{query}"
+    query_id,
+    user_prompt,
+    sql,
+    dataset
 
-def get_query_key(query_id):
+):
 
-    return f"query:{query_id}"
+    entry = {
+
+        "query_id":
+        query_id,
+
+        "timestamp":
+        str(datetime.utcnow()),
+
+        "user_prompt":
+        user_prompt,
+
+        "generated_sql":
+        sql,
+
+        "dataset":
+        dataset,
+
+        "status":
+        "STARTING",
+
+        "cache_hit":
+        False
+
+    }
+
+    redis_client.set(
+
+        get_registry_key(query_id),
+
+        json.dumps(entry)
+
+    )
+
+def update_registry(
+
+    query_id,
+    updates
+
+):
+
+    data = redis_client.get(
+
+        get_registry_key(query_id)
+
+    )
+
+    if not data:
+        return
+
+    current = json.loads(data)
+
+    current.update(updates)
+
+    redis_client.set(
+
+        get_registry_key(query_id),
+
+        json.dumps(current)
+
+    )
 
 # =========================================================
-# BACKGROUND QUERY EXECUTION
+# ATHENA EXECUTION
 # =========================================================
 
-def execute_query_background(query_id, query):
+def execute_query(
+
+    query_id,
+    sql
+
+):
 
     start_time = time.time()
 
-    try:
+    response = athena.start_query_execution(
 
-        response = athena.start_query_execution(
+        QueryString=sql,
 
-            QueryString=query,
+        QueryExecutionContext={
+            "Database": DATABASE
+        },
 
-            QueryExecutionContext={
-                "Database": DATABASE
-            },
+        ResultConfiguration={
+            "OutputLocation": OUTPUT_BUCKET
+        }
 
-            ResultConfiguration={
-                "OutputLocation": OUTPUT_BUCKET
-            }
+    )
 
-        )
+    athena_execution_id = response[
+        "QueryExecutionId"
+    ]
 
-        athena_execution_id = response[
-            "QueryExecutionId"
-        ]
+    update_registry(
 
-        redis_client.set(
+        query_id,
 
-            get_query_key(query_id),
+        {
 
-            json.dumps({
+            "status":
+            "RUNNING",
 
-                "query": query,
+            "athena_execution_id":
+            athena_execution_id
 
-                "status": "RUNNING",
+        }
 
-                "athena_execution_id":
-                athena_execution_id,
+    )
 
-                "start_time":
-                str(datetime.utcnow())
+    while True:
 
-            })
-
-        )
-
-        while True:
-
-            status = athena.get_query_execution(
-
-                QueryExecutionId=athena_execution_id
-
-            )
-
-            state = status[
-                "QueryExecution"
-            ]["Status"]["State"]
-
-            current_data = json.loads(
-
-                redis_client.get(
-
-                    get_query_key(query_id)
-
-                )
-
-            )
-
-            current_data["status"] = state
-
-            redis_client.set(
-
-                get_query_key(query_id),
-
-                json.dumps(current_data)
-
-            )
-
-            if state == "SUCCEEDED":
-                break
-
-            if state in ["FAILED", "CANCELLED"]:
-
-                current_data["status"] = state
-
-                redis_client.set(
-
-                    get_query_key(query_id),
-
-                    json.dumps(current_data)
-
-                )
-
-                return
-
-            time.sleep(2)
-
-        results = athena.get_query_results(
+        status = athena.get_query_execution(
 
             QueryExecutionId=athena_execution_id
 
         )
 
-        rows = results["ResultSet"]["Rows"]
+        state = status[
+            "QueryExecution"
+        ]["Status"]["State"]
 
-        if len(rows) <= 1:
+        update_registry(
 
-            parsed_rows = []
+            query_id,
 
-        else:
+            {
 
-            headers = [
+                "status": state
+
+            }
+
+        )
+
+        if state == "SUCCEEDED":
+            break
+
+        if state in [
+
+            "FAILED",
+            "CANCELLED"
+
+        ]:
+
+            raise Exception(
+                f"Athena query {state}"
+            )
+
+        time.sleep(2)
+
+    results = athena.get_query_results(
+
+        QueryExecutionId=athena_execution_id
+
+    )
+
+    rows = results["ResultSet"]["Rows"]
+
+    if len(rows) <= 1:
+
+        parsed_rows = []
+
+    else:
+
+        headers = [
+
+            col.get("VarCharValue", "")
+
+            for col in rows[0]["Data"]
+
+        ]
+
+        parsed_rows = []
+
+        for row in rows[1:]:
+
+            values = [
 
                 col.get("VarCharValue", "")
-                for col in rows[0]["Data"]
+
+                for col in row["Data"]
 
             ]
 
-            parsed_rows = []
+            parsed_rows.append(
 
-            for row in rows[1:]:
-
-                values = [
-
-                    col.get("VarCharValue", "")
-                    for col in row["Data"]
-
-                ]
-
-                parsed_rows.append(
-
-                    dict(zip(headers, values))
-
-                )
-
-        execution_time = round(
-
-            time.time() - start_time,
-            2
-
-        )
-
-        current_data = json.loads(
-
-            redis_client.get(
-
-                get_query_key(query_id)
+                dict(zip(headers, values))
 
             )
 
-        )
+    execution_time = round(
 
-        current_data["status"] = "COMPLETED"
+        time.time() - start_time,
 
-        current_data[
-            "execution_time_seconds"
-        ] = execution_time
+        2
 
-        redis_client.set(
+    )
 
-            get_query_key(query_id),
+    redis_client.setex(
 
-            json.dumps(current_data)
+        get_cache_key(sql),
 
-        )
+        CACHE_TTL_SECONDS,
 
-        redis_client.setex(
+        json.dumps(parsed_rows)
 
-            get_cache_key(query),
+    )
 
-            CACHE_TTL_SECONDS,
+    update_registry(
 
-            json.dumps(parsed_rows)
+        query_id,
 
-        )
+        {
 
-        redis_client.set(
-
-            f"result:{query_id}",
-
-            json.dumps(parsed_rows)
-
-        )
-
-        log_query({
-
-            "timestamp":
-            str(datetime.utcnow()),
-
-            "query_id":
-            query_id,
-
-            "query":
-            query,
+            "status":
+            "COMPLETED",
 
             "execution_time_seconds":
             execution_time,
@@ -412,37 +497,36 @@ def execute_query_background(query_id, query):
             "row_count":
             len(parsed_rows)
 
-        })
+        }
 
-    except Exception as e:
+    )
 
-        redis_client.set(
+    audit_record = json.loads(
 
-            get_query_key(query_id),
+        redis_client.get(
 
-            json.dumps({
-
-                "status": "FAILED",
-
-                "error": str(e)
-
-            })
+            get_registry_key(query_id)
 
         )
 
-# =========================================================
-# HOME
-# =========================================================
+    )
 
-@app.get("/")
-def home():
+    write_audit_record(audit_record)
 
-    return {
+    log_query({
 
-        "message":
-        "Keynes QA Analytics API Running"
+        "query_id":
+        query_id,
 
-    }
+        "query":
+        sql,
+
+        "execution_time_seconds":
+        execution_time
+
+    })
+
+    return parsed_rows
 
 # =========================================================
 # HEALTH
@@ -459,197 +543,109 @@ def health():
     }
 
 # =========================================================
-# DATASETS
+# LIVE QUERIES
 # =========================================================
 
-@app.get("/datasets")
-def get_datasets():
+@app.get("/live-queries")
+def live_queries():
+
+    keys = redis_client.keys(
+
+        "registry:*"
+
+    )
+
+    output = []
+
+    for key in keys:
+
+        output.append(
+
+            json.loads(
+
+                redis_client.get(key)
+
+            )
+
+        )
 
     return {
 
-        "available_datasets":
-        DATASETS
+        "queries": output
 
     }
 
 # =========================================================
-# ACTIVE QUERIES
+# QUERY STATS
 # =========================================================
 
-@app.get("/active-queries")
-def active_queries():
+@app.get("/query-stats")
+def query_stats():
 
-    keys = redis_client.keys("query:*")
+    keys = redis_client.keys(
 
-    queries = {}
+        "registry:*"
+
+    )
+
+    total_queries = len(keys)
+
+    completed = 0
+
+    failed = 0
+
+    total_latency = 0
 
     for key in keys:
 
-        queries[key] = json.loads(
+        data = json.loads(
 
             redis_client.get(key)
 
         )
 
-    return queries
+        if data.get("status") == "COMPLETED":
+            completed += 1
 
-# =========================================================
-# QUERY HISTORY
-# =========================================================
+        if data.get("status") == "FAILED":
+            failed += 1
 
-@app.get("/query-history")
-def query_history():
+        total_latency += data.get(
 
-    try:
+            "execution_time_seconds",
 
-        with open(LOG_FILE, "r") as f:
+            0
 
-            lines = f.readlines()
+        )
 
-        return {
+    avg_latency = 0
 
-            "queries":
-            [json.loads(x) for x in lines[-20:]]
+    if total_queries > 0:
 
-        }
+        avg_latency = round(
 
-    except:
-
-        return {
-
-            "queries": []
-
-        }
-
-# =========================================================
-# CACHE STATS
-# =========================================================
-
-@app.get("/cache-stats")
-def cache_stats():
-
-    cache_keys = redis_client.keys("cache:*")
-
-    result_keys = redis_client.keys("result:*")
-
-    query_keys = redis_client.keys("query:*")
-
-    return {
-
-        "cache_entries":
-        len(cache_keys),
-
-        "stored_results":
-        len(result_keys),
-
-        "tracked_queries":
-        len(query_keys)
-
-    }
-
-# =========================================================
-# SYSTEM HEALTH
-# =========================================================
-
-@app.get("/system-health")
-def system_health():
-
-    redis_status = "healthy"
-
-    try:
-
-        redis_client.ping()
-
-    except:
-
-        redis_status = "unhealthy"
-
-    return {
-
-        "api": "healthy",
-
-        "redis": redis_status,
-
-        "athena_region": REGION,
-
-        "database": DATABASE
-
-    }
-
-# =========================================================
-# QUERY SUMMARY
-# =========================================================
-
-@app.get("/query-summary")
-def query_summary():
-
-    try:
-
-        with open(LOG_FILE, "r") as f:
-
-            lines = f.readlines()
-
-        total_queries = len(lines)
-
-        total_execution_time = 0
-
-        successful_queries = 0
-
-        for line in lines:
-
-            try:
-
-                entry = json.loads(line)
-
-                execution_time = entry.get(
-
-                    "execution_time_seconds",
-
-                    0
-
-                )
-
-                total_execution_time += execution_time
-
-                successful_queries += 1
-
-            except:
-
-                pass
-
-        average_latency = 0
-
-        if successful_queries > 0:
-
-            average_latency = round(
-
-                total_execution_time /
-                successful_queries,
-
-                2
-
-            )
-
-        return {
-
-            "total_queries":
+            total_latency /
             total_queries,
 
-            "successful_queries":
-            successful_queries,
+            2
 
-            "average_latency_seconds":
-            average_latency
+        )
 
-        }
+    return {
 
-    except Exception as e:
+        "total_queries":
+        total_queries,
 
-        return {
+        "completed":
+        completed,
 
-            "error": str(e)
+        "failed":
+        failed,
 
-        }
+        "average_latency_seconds":
+        avg_latency
+
+    }
 
 # =========================================================
 # SLOW QUERIES
@@ -658,157 +654,238 @@ def query_summary():
 @app.get("/slow-queries")
 def slow_queries():
 
+    keys = redis_client.keys(
+
+        "registry:*"
+
+    )
+
     slow = []
 
-    try:
+    for key in keys:
 
-        with open(LOG_FILE, "r") as f:
+        data = json.loads(
 
-            lines = f.readlines()
-
-        for line in lines:
-
-            try:
-
-                entry = json.loads(line)
-
-                execution_time = entry.get(
-
-                    "execution_time_seconds",
-
-                    0
-
-                )
-
-                if execution_time >= 5:
-
-                    slow.append(entry)
-
-            except:
-
-                pass
-
-        slow = sorted(
-
-            slow,
-
-            key=lambda x:
-            x.get(
-                "execution_time_seconds",
-                0
-            ),
-
-            reverse=True
+            redis_client.get(key)
 
         )
 
-        return {
+        latency = data.get(
 
-            "slow_queries":
-            slow[:20]
+            "execution_time_seconds",
 
-        }
+            0
 
-    except Exception as e:
+        )
 
-        return {
+        if latency >= 5:
 
-            "error": str(e)
+            slow.append(data)
 
-        }
+    slow = sorted(
 
-# =========================================================
-# METRICS
-# =========================================================
+        slow,
 
-@app.get("/metrics")
-def metrics():
+        key=lambda x:
+        x.get(
+            "execution_time_seconds",
+            0
+        ),
 
-    try:
+        reverse=True
 
-        cache_keys = redis_client.keys("cache:*")
+    )
 
-        result_keys = redis_client.keys("result:*")
+    return {
 
-        query_keys = redis_client.keys("query:*")
+        "slow_queries":
+        slow[:20]
 
-        with open(LOG_FILE, "r") as f:
-
-            lines = f.readlines()
-
-        total_queries = len(lines)
-
-        total_execution_time = 0
-
-        for line in lines:
-
-            try:
-
-                entry = json.loads(line)
-
-                total_execution_time += entry.get(
-
-                    "execution_time_seconds",
-
-                    0
-
-                )
-
-            except:
-
-                pass
-
-        average_latency = 0
-
-        if total_queries > 0:
-
-            average_latency = round(
-
-                total_execution_time /
-                total_queries,
-
-                2
-
-            )
-
-        return {
-
-            "total_queries":
-            total_queries,
-
-            "average_latency_seconds":
-            average_latency,
-
-            "cache_entries":
-            len(cache_keys),
-
-            "stored_results":
-            len(result_keys),
-
-            "tracked_queries":
-            len(query_keys),
-
-            "redis_status":
-            "healthy"
-
-        }
-
-    except Exception as e:
-
-        return {
-
-            "error": str(e)
-
-        }
+    }
 
 # =========================================================
-# START QUERY
+# TOP DATASETS
 # =========================================================
 
-@app.post("/query/start")
-def start_query(payload: dict):
+@app.get("/top-datasets")
+def top_datasets():
+
+    keys = redis_client.keys(
+
+        "registry:*"
+
+    )
+
+    datasets = []
+
+    for key in keys:
+
+        data = json.loads(
+
+            redis_client.get(key)
+
+        )
+
+        dataset = data.get("dataset")
+
+        if dataset:
+            datasets.append(dataset)
+
+    counts = Counter(datasets)
+
+    return {
+
+        "top_datasets":
+        counts.most_common(10)
+
+    }
+
+# =========================================================
+# CACHE ANALYTICS
+# =========================================================
+
+@app.get("/cache-analytics")
+def cache_analytics():
+
+    keys = redis_client.keys(
+
+        "registry:*"
+
+    )
+
+    total = len(keys)
+
+    hits = 0
+
+    for key in keys:
+
+        data = json.loads(
+
+            redis_client.get(key)
+
+        )
+
+        if data.get("cache_hit"):
+            hits += 1
+
+    ratio = 0
+
+    if total > 0:
+
+        ratio = round(
+
+            (hits / total) * 100,
+
+            2
+
+        )
+
+    return {
+
+        "total_queries":
+        total,
+
+        "cache_hits":
+        hits,
+
+        "cache_hit_ratio_percent":
+        ratio
+
+    }
+
+# =========================================================
+# FAILED QUERIES
+# =========================================================
+
+@app.get("/failed-queries")
+def failed_queries():
+
+    keys = redis_client.keys(
+
+        "registry:*"
+
+    )
+
+    failed = []
+
+    for key in keys:
+
+        data = json.loads(
+
+            redis_client.get(key)
+
+        )
+
+        if data.get("status") == "FAILED":
+
+            failed.append(data)
+
+    return {
+
+        "failed_queries":
+        failed
+
+    }
+
+# =========================================================
+# PROMPT ANALYTICS
+# =========================================================
+
+@app.get("/prompt-analytics")
+def prompt_analytics():
+
+    keys = redis_client.keys(
+
+        "registry:*"
+
+    )
+
+    prompts = []
+
+    for key in keys:
+
+        data = json.loads(
+
+            redis_client.get(key)
+
+        )
+
+        prompt = data.get(
+
+            "user_prompt",
+
+            ""
+
+        )
+
+        if prompt:
+            prompts.append(prompt)
+
+    counts = Counter(prompts)
+
+    return {
+
+        "top_prompts":
+        counts.most_common(20)
+
+    }
+
+# =========================================================
+# QUERY
+# =========================================================
+
+@app.post("/query")
+def query(payload: dict):
 
     sql = payload.get("sql")
+
+    user_prompt = payload.get(
+
+        "user_prompt",
+
+        "unknown"
+
+    )
 
     if not sql:
 
@@ -836,11 +913,55 @@ def start_query(payload: dict):
 
     sql = validation["sql"]
 
+    dataset = validation.get("dataset")
+
+    query_id = str(uuid.uuid4())
+
+    register_query(
+
+        query_id,
+        user_prompt,
+        sql,
+        dataset
+
+    )
+
     cache_key = get_cache_key(sql)
 
     cached = redis_client.get(cache_key)
 
     if cached:
+
+        update_registry(
+
+            query_id,
+
+            {
+
+                "status":
+                "COMPLETED",
+
+                "cache_hit":
+                True,
+
+                "row_count":
+                len(json.loads(cached))
+
+            }
+
+        )
+
+        audit_record = json.loads(
+
+            redis_client.get(
+
+                get_registry_key(query_id)
+
+            )
+
+        )
+
+        write_audit_record(audit_record)
 
         return {
 
@@ -848,117 +969,61 @@ def start_query(payload: dict):
 
             "cached": True,
 
+            "query_id":
+            query_id,
+
             "results":
             json.loads(cached)
 
         }
 
-    query_id = str(uuid.uuid4())
+    try:
 
-    redis_client.set(
+        results = execute_query(
 
-        get_query_key(query_id),
+            query_id,
+            sql
 
-        json.dumps({
+        )
 
-            "query": sql,
+        return {
 
-            "status": "STARTING",
+            "success": True,
 
-            "start_time":
-            str(datetime.utcnow())
+            "query_id":
+            query_id,
 
-        })
+            "results":
+            results
 
-    )
+        }
 
-    thread = threading.Thread(
+    except Exception as e:
 
-        target=execute_query_background,
+        update_registry(
 
-        args=(query_id, sql)
+            query_id,
 
-    )
+            {
 
-    thread.start()
+                "status":
+                "FAILED",
 
-    return {
+                "error":
+                str(e)
 
-        "success": True,
+            }
 
-        "query_id": query_id,
-
-        "status": "STARTED"
-
-    }
-
-# =========================================================
-# QUERY STATUS
-# =========================================================
-
-@app.get("/query/status/{query_id}")
-def query_status(query_id: str):
-
-    data = redis_client.get(
-
-        get_query_key(query_id)
-
-    )
-
-    if not data:
+        )
 
         return {
 
             "success": False,
 
             "error":
-            "Query not found"
+            str(e)
 
         }
-
-    return json.loads(data)
-
-# =========================================================
-# QUERY RESULT
-# =========================================================
-
-@app.get("/query/result/{query_id}")
-def query_result(query_id: str):
-
-    result = redis_client.get(
-
-        f"result:{query_id}"
-
-    )
-
-    if not result:
-
-        return {
-
-            "success": False,
-
-            "message":
-            "Result not ready"
-
-        }
-
-    return {
-
-        "success": True,
-
-        "results":
-        json.loads(result)
-
-    }
-
-# =========================================================
-# LEGACY QUERY
-# =========================================================
-
-@app.post("/query")
-def query(payload: dict):
-
-    return start_query(payload)
 
 # =========================================================
 # MAIN

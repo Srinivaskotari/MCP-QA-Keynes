@@ -1,91 +1,172 @@
 from fastmcp import FastMCP
+
 import requests
 
-BASE_URL = "http://localhost:8000"
+# =====================================================
+# MCP SERVER
+# =====================================================
 
 mcp = FastMCP(
-    "Keynes QA Advertiser Intelligence"
+    "Keynes QA MCP Server"
 )
 
-# =========================================================
-# CURRENT DATE
-# =========================================================
+# =====================================================
+# GET CURRENT DATE
+# =====================================================
 
 @mcp.tool()
-def get_current_date():
-
-    response = requests.get(
-        f"{BASE_URL}/current-date"
-    )
-
-    return response.json()
-
-# =========================================================
-# DATASETS
-# =========================================================
-
-@mcp.tool()
-def get_available_datasets():
-
-    response = requests.get(
-        f"{BASE_URL}/datasets"
-    )
-
-    return response.json()
-
-# =========================================================
-# TABLE SCHEMA
-# =========================================================
-
-@mcp.tool()
-def get_table_schema(table_name: str):
+async def get_current_date():
 
     """
-    Returns actual Athena schema
-    for a dataset.
-
-    Use before querying if unsure
-    about column names.
+    Returns current system date.
     """
 
     response = requests.get(
-        f"{BASE_URL}/schema/{table_name}"
+        "http://localhost:8000/date"
     )
 
     return response.json()
 
-# =========================================================
+# =====================================================
 # QUERY ATHENA
-# =========================================================
+# =====================================================
 
 @mcp.tool()
-def query_athena(sql: str):
+async def query_athena(
+    query: str
+):
 
-    print("\n[MCP TOOL] query_athena called")
-    print("\nGenerated SQL:")
-    print(sql)
+    """
+    Execute Athena analytics queries.
+    """
 
     response = requests.post(
 
-        f"{BASE_URL}/query",
+        "http://localhost:8000/query",
 
         json={
-            "sql": sql
+            "query": query
         }
-
     )
 
     return response.json()
 
-# =========================================================
-# MAIN
-# =========================================================
+# =====================================================
+# LIST ALL ADVERTISERS
+# =====================================================
+
+@mcp.tool()
+async def list_all_advertisers():
+
+    """
+    Returns advertiser list.
+    """
+
+    response = requests.get(
+        "http://localhost:8000/advertisers"
+    )
+
+    return response.json()
+
+# =====================================================
+# GET MONTHLY USERS
+# =====================================================
+
+@mcp.tool()
+async def get_monthly_users():
+
+    """
+    Returns monthly users analytics.
+    """
+
+    response = requests.get(
+        "http://localhost:8000/ga/monthly-users"
+    )
+
+    return response.json()
+
+# =====================================================
+# GET GA4 DATA
+# =====================================================
+
+@mcp.tool()
+async def get_ga4_data(
+    advertiser: str,
+    level: str
+):
+
+    """
+    Returns GA4 analytics data.
+
+    Levels:
+    - source_medium
+    - country
+    - device
+    - channel
+    """
+
+    endpoint_map = {
+
+        "source_medium":
+        "http://localhost:8000/ga/source-medium",
+
+        "country":
+        "http://localhost:8000/ga/country",
+
+        "device":
+        "http://localhost:8000/ga/device",
+
+        "channel":
+        "http://localhost:8000/ga/channel"
+    }
+
+    endpoint = endpoint_map.get(
+        level
+    )
+
+    if not endpoint:
+
+        return {
+
+            "success": False,
+
+            "error":
+            f"Unsupported level: {level}"
+        }
+
+    response = requests.get(
+        endpoint
+    )
+
+    return response.json()
+
+# =====================================================
+# HEALTH CHECK
+# =====================================================
+
+@mcp.tool()
+async def health_check():
+
+    """
+    Health check tool.
+    """
+
+    return {
+
+        "success": True,
+
+        "service":
+        "keynes-qa-mcp",
+
+        "status":
+        "running"
+    }
+
+# =====================================================
+# RUN MCP SERVER
+# =====================================================
 
 if __name__ == "__main__":
-
-    print(
-        "\nStarting Keynes QA MCP Server..."
-    )
 
     mcp.run(
 
@@ -94,5 +175,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
 
         port=9000
-
     )
